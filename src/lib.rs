@@ -1,5 +1,10 @@
+use crate::reactor::Reactor;
 use flume::{Receiver, Sender, WeakSender};
+use once_cell::sync::Lazy;
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,73 +12,11 @@ use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
-mod waker {
-    use crate::TaskId;
-    use flume::Sender;
-    use std::sync::Arc;
-    use std::task::{RawWaker, RawWakerVTable, Waker};
+pub mod net;
+pub(crate) mod reactor;
+mod waker;
 
-    type State = Arc<StateInner>;
-
-    pub struct StateInner {
-        task_id: TaskId,
-        ready_sender: Sender<TaskId>,
-    }
-
-    impl StateInner {
-        pub fn new(task_id: TaskId, ready_sender: Sender<TaskId>) -> Arc<Self> {
-            Arc::new(Self {
-                task_id,
-                ready_sender,
-            })
-        }
-
-        pub fn into_waker(self: Arc<Self>) -> Waker {
-            unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(self) as *const (), &VTABLE)) }
-        }
-
-        pub fn wake(&self) {
-            println!("Waking: {:?}", self.task_id);
-
-            self.ready_sender.send(self.task_id).unwrap();
-        }
-    }
-
-    unsafe fn from_ptr(p: *const ()) -> State {
-        Arc::from_raw(p as *const StateInner)
-    }
-
-    unsafe fn clone(p: *const ()) -> RawWaker {
-        let state = from_ptr(p);
-        let ptr = Arc::into_raw(Arc::clone(&state)) as *const ();
-
-        // Keep the state alive
-        let _ = Arc::into_raw(state);
-
-        RawWaker::new(ptr, &VTABLE)
-    }
-
-    unsafe fn wake(p: *const ()) {
-        let state = from_ptr(p);
-        state.wake();
-
-        // State drops here
-    }
-
-    unsafe fn wake_by_ref(p: *const ()) {
-        let state = from_ptr(p);
-        state.wake();
-
-        // Keep the state alive
-        let _ = Arc::into_raw(state);
-    }
-
-    unsafe fn drop(p: *const ()) {
-        from_ptr(p); // Dropped here
-    }
-
-    pub(crate) const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-}
+pub static GLOBAL_REACTOR: Lazy<Reactor> = Lazy::new(Reactor::spawn);
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct TaskId(pub usize);
@@ -93,12 +36,19 @@ pub struct Task {
     counter: Arc<()>,
 }
 
+thread_local! {
+    pub static CURRENT_TASK: Cell<TaskId> = const { Cell::new(TaskId::NONE) };
+}
+
 fn worker(todo_recv: Receiver<Task>, done_send: Sender<Task>, ready_send: Sender<TaskId>) {
     for mut task in todo_recv.iter() {
         let waker = waker::StateInner::new(task.id, ready_send.clone()).into_waker();
         let mut ctx = Context::from_waker(&waker);
 
         let fut = task.fut.as_mut();
+
+        let old_task = CURRENT_TASK.replace(task.id);
+        assert_eq!(old_task, TaskId::NONE);
 
         match fut.poll(&mut ctx) {
             Poll::Ready(()) => {
@@ -110,6 +60,8 @@ fn worker(todo_recv: Receiver<Task>, done_send: Sender<Task>, ready_send: Sender
             }
             Poll::Pending => done_send.send(task).unwrap(),
         }
+
+        CURRENT_TASK.set(TaskId::NONE);
     }
 }
 
@@ -135,12 +87,15 @@ impl RunTime {
         let (ready_sender, ready_recv) = flume::unbounded();
 
         let workers = (0..8)
-            .map(|_| {
+            .map(|i| {
                 let todo = todo_recv.clone();
                 let done = done_sender.clone();
                 let ready = ready_sender.clone();
 
-                std::thread::spawn(move || worker(todo, done, ready))
+                std::thread::Builder::new()
+                    .name(format!("worker{i}"))
+                    .spawn(move || worker(todo, done, ready))
+                    .unwrap()
             })
             .collect();
 
@@ -215,8 +170,18 @@ impl RunTime {
     }
 }
 
+#[derive(Debug)]
 pub struct RunTimeDead;
 
+impl Display for RunTimeDead {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RunTimeDead").finish()
+    }
+}
+
+impl Error for RunTimeDead {}
+
+#[derive(Clone)]
 pub struct Spawner {
     todo_sender: WeakSender<Task>,
     counter: Weak<()>,

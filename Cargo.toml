@@ -7,4 +7,8 @@ edition = "2021"
 
 [dependencies]
 flume = "0.11.0"
-mio = { version = "0.8.10", features = ["net"] }
+mio = { version = "0.8.10", features = ["net", "os-poll"] }
+once_cell = "1.19.0"
+
+[patch.crates-io]
+flume = { git = "https://github.com/zesterer/flume.git" }
